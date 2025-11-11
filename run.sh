@@ -1,6 +1,6 @@
 python -m paper_agent.cli \
-    --date-range 2025-11-01 2025-11-01  \
-    --max-results 10 \
+    --date-range 2025-11-01 2025-11-10  \
+    --max-results 50 \
     --relevance-threshold 0.8 \
     --fallback-report-limit 20 \
     --send-email \

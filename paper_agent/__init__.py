@@ -5,7 +5,7 @@ paper_agent: Minimal LLM-powered paper classification and recommendation pipelin
 from importlib import import_module
 from typing import Any
 
-__all__ = ["generate_recommendations", "PipelineSettings"]
+__all__ = ["generate_recommendations", "generate_gap_fill_digest", "PipelineSettings"]
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover - simple lazy loader

@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import List
 
 from .models import AVAILABLE_SOURCES, PipelineSettings
-from .pipeline import generate_recommendations
+from .pipeline import generate_gap_fill_digest, generate_recommendations
 
 
 def _valid_date(value: str) -> date:
@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
         metavar=("START_DATE", "END_DATE"),
         type=_valid_date,
         help="Target arXiv submission date range in YYYY-MM-DD YYYY-MM-DD (inclusive).",
+    )
+    date_group.add_argument(
+        "--gap-fill-week",
+        nargs=2,
+        metavar=("GAP_START", "GAP_END"),
+        type=_valid_date,
+        help="Run a weekly gap-fill digest using cached keyword-filtered papers from the inclusive date range.",
     )
     parser.add_argument(
         "--max-results",
@@ -87,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help="Explicit list of keywords that must appear in every selected paper (overrides file setting).",
     )
+    parser.add_argument(
+        "--gap-fill-limit",
+        type=int,
+        help="Optional cap on the number of cached candidates to evaluate during a gap-fill run.",
+    )
     return parser.parse_args()
 
 
@@ -121,9 +133,20 @@ def main() -> None:
     settings_kwargs["llm_max_workers"] = args.llm_workers
 
     settings = PipelineSettings(**settings_kwargs)
-    result = generate_recommendations(settings)
-    print(f"Email subject: {result.email_subject}")
-    print("Email preview:")
+    if args.gap_fill_week:
+        week_start, week_end = args.gap_fill_week
+        result = generate_gap_fill_digest(
+            settings,
+            week_start=week_start,
+            week_end=week_end,
+            max_candidates=args.gap_fill_limit,
+        )
+        print(f"Gap-fill subject: {result.email_subject}")
+        print("Gap-fill report preview:")
+    else:
+        result = generate_recommendations(settings)
+        print(f"Email subject: {result.email_subject}")
+        print("Email preview:")
     print(result.email_body)
     if args.output_json:
         with open(args.output_json, "w", encoding="utf-8") as fh:

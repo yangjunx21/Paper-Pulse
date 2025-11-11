@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, Iterable, List, Optional, Sequence
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .cache import CacheManager
 from .config import get_optional_email_config
 from .fetchers import PaperFetcher, get_fetcher
 from .llm import LLMChatRequest, LLMClient, LLMMessage
@@ -24,6 +27,14 @@ LOGGER = logging.getLogger(__name__)
 
 L1_REQUIRED_CATEGORIES = {"cs.CL", "cs.LG", "cs.AI"}
 L1_OPTIONAL_CATEGORIES = {"cs.CR", "cs.CY"}
+
+
+@dataclass
+class Layer1FilterOutcome:
+    retained: List[RawPaper]
+    removed_by_category: List[RawPaper]
+    removed_by_keywords: List[RawPaper]
+    removed_by_required: List[RawPaper]
 
 
 def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
@@ -53,62 +64,92 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         focus,
         "enabled" if should_send_email else "disabled",
     )
+    cache = CacheManager()
     init_step_index = log_step("初始化数据源与客户端")
-    fetchers = _instantiate_fetchers(settings.sources)
-    if not fetchers:
-        raise ValueError(
-            f"No valid fetchers available for requested sources: {', '.join(settings.sources)}."
-        )
-    LOGGER.info(
-        "[Step %d/%d] 已准备 %d 个数据源：%s",
-        init_step_index,
-        total_steps,
-        len(fetchers),
-        ", ".join(fetcher.source_name for fetcher in fetchers),
-    )
     llm = LLMClient()
-    fetch_kwargs = {
-        "target_date": settings.target_date,
-        "start_date": settings.start_date,
-        "end_date": settings.end_date,
-        "max_results": None,
-    }
-    aggregated: Dict[str, RawPaper] = {}
-    total_collected = 0
-    fetch_step_index = log_step("拉取原始论文数据")
-    for idx, fetcher in enumerate(fetchers, start=1):
+    raw_papers = cache.load_raw_papers(settings)
+    fetchers: List[PaperFetcher] = []
+    if raw_papers is None:
+        fetchers = _instantiate_fetchers(settings.sources)
+        if not fetchers:
+            raise ValueError(
+                f"No valid fetchers available for requested sources: {', '.join(settings.sources)}."
+            )
         LOGGER.info(
-            "[Step %d/%d] 拉取进度 %d/%d -> 来源 %s",
+            "[Step %d/%d] 已准备 %d 个数据源：%s",
+            init_step_index,
+            total_steps,
+            len(fetchers),
+            ", ".join(fetcher.source_name for fetcher in fetchers),
+        )
+    else:
+        LOGGER.info(
+            "[Step %d/%d] 缓存命中，跳过数据源初始化（sources: %s）。",
+            init_step_index,
+            total_steps,
+            source_descriptor,
+        )
+
+    raw_key: Optional[str] = None
+    if raw_papers is None:
+        fetch_step_index = log_step("拉取原始论文数据")
+        fetch_kwargs = {
+            "target_date": settings.target_date,
+            "start_date": settings.start_date,
+            "end_date": settings.end_date,
+            "max_results": None,
+        }
+        aggregated: Dict[str, RawPaper] = {}
+        total_collected = 0
+        for idx, fetcher in enumerate(fetchers, start=1):
+            LOGGER.info(
+                "[Step %d/%d] 拉取进度 %d/%d -> 来源 %s",
+                fetch_step_index,
+                total_steps,
+                idx,
+                len(fetchers),
+                fetcher.source_name,
+            )
+            try:
+                fetched = fetcher.fetch(**fetch_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.error("Failed to fetch papers from source '%s': %s", fetcher.source_name, exc, exc_info=exc)
+                continue
+            LOGGER.info("Source %s returned %d papers.", fetcher.source_name, len(fetched))
+            for paper in fetched:
+                total_collected += 1
+                existing = aggregated.get(paper.id)
+                if existing:
+                    aggregated[paper.id] = _merge_raw_papers(existing, paper)
+                else:
+                    aggregated[paper.id] = paper
+        raw_papers = list(aggregated.values())
+        if not raw_papers:
+            raise ValueError(
+                f"No papers fetched for {date_descriptor} from sources: {', '.join(settings.sources)}."
+            )
+        if total_collected != len(raw_papers):
+            LOGGER.info(
+                "Collected %d unique papers after deduplication (total fetched=%d).",
+                len(raw_papers),
+                total_collected,
+            )
+        raw_key = cache.store_raw_papers(settings, raw_papers)
+        LOGGER.info(
+            "Cached %d raw papers for %s (key=%s).",
+            len(raw_papers),
+            date_descriptor,
+            raw_key[:8],
+        )
+    else:
+        raw_key = cache.raw_key(settings)
+        fetch_step_index = log_step("加载缓存的原始论文数据")
+        LOGGER.info(
+            "[Step %d/%d] 从缓存加载 %d 篇原始论文 (key=%s)。",
             fetch_step_index,
             total_steps,
-            idx,
-            len(fetchers),
-            fetcher.source_name,
-        )
-        try:
-            fetched = fetcher.fetch(**fetch_kwargs)
-        except Exception as exc:  # pylint: disable=broad-except
-            LOGGER.error("Failed to fetch papers from source '%s': %s", fetcher.source_name, exc, exc_info=exc)
-            continue
-        LOGGER.info("Source %s returned %d papers.", fetcher.source_name, len(fetched))
-        for paper in fetched:
-            total_collected += 1
-            existing = aggregated.get(paper.id)
-            if existing:
-                aggregated[paper.id] = _merge_raw_papers(existing, paper)
-            else:
-                aggregated[paper.id] = paper
-
-    raw_papers = list(aggregated.values())
-    if not raw_papers:
-        raise ValueError(
-            f"No papers fetched for {date_descriptor} from sources: {', '.join(settings.sources)}."
-        )
-    if total_collected != len(raw_papers):
-        LOGGER.info(
-            "Collected %d unique papers after deduplication (total fetched=%d).",
             len(raw_papers),
-            total_collected,
+            raw_key[:8],
         )
 
     keyword_config = resolve_keywords(
@@ -123,14 +164,51 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         len(keywords),
         len(required_keywords),
     )
-    log_step("应用 Layer 1 过滤器")
+    filter_step_index = log_step("应用 Layer 1 过滤器")
     LOGGER.info(
         "Fetched %d papers for %s from sources %s. Applying Layer 1 category and keyword filters.",
         len(raw_papers),
         date_descriptor,
         source_descriptor,
     )
-    layer1_candidates = apply_layer1_filters(raw_papers, keywords, required_keywords)
+    layer1_candidates = cache.load_layer1_candidates(
+        settings,
+        raw_papers,
+        keywords=keywords,
+        required_keywords=required_keywords,
+    )
+    filter_outcome: Optional[Layer1FilterOutcome] = None
+    if layer1_candidates is None:
+        filter_outcome = apply_layer1_filters_with_trace(raw_papers, keywords, required_keywords)
+        layer1_candidates = filter_outcome.retained
+        cache.store_layer1_result(
+            settings,
+            raw_key=raw_key or cache.raw_key(settings),
+            raw_papers=raw_papers,
+            retained=filter_outcome.retained,
+            removed_by_category=filter_outcome.removed_by_category,
+            removed_by_keywords=filter_outcome.removed_by_keywords,
+            removed_by_required=filter_outcome.removed_by_required,
+            keywords=keywords,
+            required_keywords=required_keywords,
+        )
+        LOGGER.info(
+            "[Step %d/%d] Layer 1 retention=%d, removed(category=%d, keyword=%d, required=%d).",
+            filter_step_index,
+            total_steps,
+            len(filter_outcome.retained),
+            len(filter_outcome.removed_by_category),
+            len(filter_outcome.removed_by_keywords),
+            len(filter_outcome.removed_by_required),
+        )
+    else:
+        LOGGER.info(
+            "[Step %d/%d] Layer 1 candidates loaded from cache with %d retained papers.",
+            filter_step_index,
+            total_steps,
+            len(layer1_candidates),
+        )
+
     if settings.max_results_per_topic > 0:
         layer1_candidates = layer1_candidates[: settings.max_results_per_topic]
     if not layer1_candidates:
@@ -151,6 +229,7 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         required_keywords,
         classification_system_prompt,
         max_workers=settings.llm_max_workers,
+        cache=cache,
     )
     if not classified:
         raise ValueError("LLM classification returned no valid papers.")
@@ -173,8 +252,25 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         paper.model_copy(update={"rank": idx})
         for idx, paper in enumerate(relevant_ranked, start=1)
     ]
-    log_step("生成 LLM 摘要")
-    relevant_ranked = summarize_ranked_papers(llm, relevant_ranked)
+    relevant_ranked, missing_summaries = _apply_cached_summaries(cache, relevant_ranked)
+    summary_step_index = log_step("生成 LLM 摘要")
+    if missing_summaries > 0:
+        LOGGER.info(
+            "[Step %d/%d] 将为 %d 篇论文生成或更新摘要，其余摘要来自缓存。",
+            summary_step_index,
+            total_steps,
+            missing_summaries,
+        )
+        relevant_ranked = summarize_ranked_papers(llm, relevant_ranked)
+        for ranked_paper in relevant_ranked:
+            if cache and ranked_paper.summary:
+                cache.store_summary(ranked_paper.paper, ranked_paper.summary)
+    else:
+        LOGGER.info(
+            "[Step %d/%d] 全部摘要从缓存加载，跳过 LLM 调用。",
+            summary_step_index,
+            total_steps,
+        )
     log_step("构建日报内容")
     email_subject, email_body = build_daily_report(
         relevant_ranked,
@@ -197,6 +293,114 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         len(relevant_ranked),
     )
 
+    return PipelineResult(
+        settings=settings,
+        papers=relevant_ranked,
+        email_subject=email_subject,
+        email_body=email_body,
+    )
+
+
+def generate_gap_fill_digest(
+    settings: PipelineSettings,
+    *,
+    week_start: date,
+    week_end: date,
+    max_candidates: Optional[int] = None,
+) -> PipelineResult:
+    if week_start > week_end:
+        raise ValueError("week_start must be on or before week_end.")
+    email_config = get_optional_email_config()
+    should_send_email = bool(settings.send_email and email_config)
+    cache = CacheManager()
+    llm = LLMClient()
+    focus = "; ".join(settings.topics) if settings.topics else "LLM Safety"
+    source_descriptor = ", ".join(settings.sources)
+    LOGGER.info(
+        "Starting weekly gap-fill run for %s to %s (focus=%s).",
+        week_start.isoformat(),
+        week_end.isoformat(),
+        focus,
+    )
+    candidates = cache.get_keyword_filtered_papers(start_date=week_start, end_date=week_end)
+    if not candidates:
+        raise ValueError("No cached keyword-filtered papers found for the requested week.")
+    if max_candidates:
+        candidates = candidates[:max_candidates]
+    unique_candidates: Dict[str, RawPaper] = {}
+    for paper in candidates:
+        unique_candidates.setdefault(paper.id, paper)
+    candidate_list = list(unique_candidates.values())
+    LOGGER.info(
+        "Gap-fill classification will evaluate %d previously filtered papers.",
+        len(candidate_list),
+    )
+    keyword_config = resolve_keywords(
+        settings.keywords,
+        settings.required_keywords,
+        keyword_file=settings.keywords_file,
+    )
+    classification_system_prompt = build_classification_system_prompt(
+        keyword_config.keywords,
+        keyword_config.required_keywords,
+    )
+    classified = classify_with_llm(
+        llm,
+        candidate_list,
+        focus,
+        keyword_config.keywords,
+        keyword_config.required_keywords,
+        classification_system_prompt,
+        max_workers=settings.llm_max_workers,
+        cache=cache,
+    )
+    if not classified:
+        raise ValueError("Weekly gap-fill classification returned no valid papers.")
+    ranked_all = HybridRanker().rank(classified)
+    relevant_ranked = [
+        paper
+        for paper in ranked_all
+        if paper.is_relevant or paper.relevance_score >= settings.relevance_threshold
+    ]
+    if not relevant_ranked:
+        LOGGER.warning(
+            "Weekly gap-fill found no papers above threshold %.2f; returning top %d candidates instead.",
+            settings.relevance_threshold,
+            settings.fallback_report_limit,
+        )
+        relevant_ranked = ranked_all[: settings.fallback_report_limit]
+    relevant_ranked = [
+        paper.model_copy(update={"rank": idx})
+        for idx, paper in enumerate(relevant_ranked, start=1)
+    ]
+    relevant_ranked, missing_summaries = _apply_cached_summaries(cache, relevant_ranked)
+    if missing_summaries > 0:
+        LOGGER.info(
+            "Generating new summaries for %d gap-fill papers.",
+            missing_summaries,
+        )
+        relevant_ranked = summarize_ranked_papers(llm, relevant_ranked)
+        for ranked_paper in relevant_ranked:
+            if ranked_paper.summary:
+                cache.store_summary(ranked_paper.paper, ranked_paper.summary)
+    date_descriptor = f"{week_start.isoformat()} 至 {week_end.isoformat()}（关键词补漏）"
+    _, email_body = build_daily_report(
+        relevant_ranked,
+        focus,
+        date_descriptor,
+        source_descriptor,
+    )
+    email_subject = f"每周 LLM Safety 补漏 ({week_start.isoformat()} 至 {week_end.isoformat()})"
+    if should_send_email and email_config:
+        EmailClient(email_config).send_markdown_email(
+            subject=email_subject,
+            body_markdown=email_body,
+            receiver=settings.receiver_email,
+        )
+    LOGGER.info(
+        "Weekly gap-fill completed with %d highlighted papers.",
+        len(relevant_ranked),
+    )
     return PipelineResult(
         settings=settings,
         papers=relevant_ranked,
@@ -249,6 +453,15 @@ def apply_layer1_filters(
     keywords: Iterable[str],
     required_keywords: Iterable[str],
 ) -> List[RawPaper]:
+    outcome = apply_layer1_filters_with_trace(papers, keywords, required_keywords)
+    return outcome.retained
+
+
+def apply_layer1_filters_with_trace(
+    papers: Iterable[RawPaper],
+    keywords: Iterable[str],
+    required_keywords: Iterable[str],
+) -> Layer1FilterOutcome:
     paper_list = list(papers)
     LOGGER.debug("Layer 1 starting with %d papers.", len(paper_list))
     categorized = filter_papers_by_categories(paper_list)
@@ -260,7 +473,18 @@ def apply_layer1_filters(
         len(keyword_filtered),
         len(required_filtered),
     )
-    return required_filtered
+    categorized_ids = {paper.id for paper in categorized}
+    keyword_ids = {paper.id for paper in keyword_filtered}
+    required_ids = {paper.id for paper in required_filtered}
+    removed_by_category = [paper for paper in paper_list if paper.id not in categorized_ids]
+    removed_by_keywords = [paper for paper in categorized if paper.id not in keyword_ids]
+    removed_by_required = [paper for paper in keyword_filtered if paper.id not in required_ids]
+    return Layer1FilterOutcome(
+        retained=required_filtered,
+        removed_by_category=removed_by_category,
+        removed_by_keywords=removed_by_keywords,
+        removed_by_required=removed_by_required,
+    )
 
 
 def filter_papers_by_categories(papers: Iterable[RawPaper]) -> List[RawPaper]:
@@ -341,20 +565,41 @@ def classify_with_llm(
     system_prompt: str,
     *,
     max_workers: int = 4,
+    cache: CacheManager | None = None,
 ) -> List[ClassifiedPaper]:
     paper_list = list(papers)
     if not paper_list:
         LOGGER.info("No papers provided for LLM classification.")
         return []
-    LOGGER.info(
-        "Submitting %d papers for LLM classification (max_workers=%d).",
-        len(paper_list),
-        max_workers,
-    )
-    requests: List[LLMChatRequest] = []
+
+    result_map: Dict[str, ClassifiedPaper] = {}
+    pending_requests: List[LLMChatRequest] = []
+    pending_papers: List[RawPaper] = []
+    cached_exact = 0
+    cached_fallback = 0
+    keywords_text = ", ".join(keywords) if keywords else "未提供"
+    required_keywords_text = ", ".join(required_keywords) if required_keywords else "无"
+
     for paper in paper_list:
-        keywords_text = ", ".join(keywords) if keywords else "未提供"
-        required_keywords_text = ", ".join(required_keywords) if required_keywords else "无"
+        cached_result: Optional[ClassifiedPaper] = None
+        exact_match = False
+        if cache:
+            cached_result, exact_match = cache.load_classification(
+                paper,
+                focus=focus,
+                keywords=keywords,
+                required_keywords=required_keywords,
+                system_prompt=system_prompt,
+                allow_cross_context=True,
+            )
+        if cached_result:
+            result_map[paper.id] = cached_result
+            if exact_match:
+                cached_exact += 1
+            else:
+                cached_fallback += 1
+            continue
+
         payload = CLASSIFICATION_USER_PROMPT_TEMPLATE.format(
             focus=focus,
             keywords=keywords_text,
@@ -372,68 +617,112 @@ def classify_with_llm(
             LLMMessage(role="system", content=system_prompt or CLASSIFICATION_SYSTEM_PROMPT),
             LLMMessage(role="user", content=payload),
         ]
-        requests.append(
+        pending_requests.append(
             LLMChatRequest(
                 messages=messages,
                 temperature=0.0,
                 metadata={"paper_id": paper.id},
             )
         )
+        pending_papers.append(paper)
 
-    batched_results = llm.chat_completion_batch(
-        requests,
-        max_workers=max_workers,
-        allow_errors=True,
-    )
+    fresh_success = 0
+    if pending_requests:
+        LOGGER.info(
+            "Submitting %d papers for LLM classification (max_workers=%d, cache_exact=%d, cache_cross_topic=%d).",
+            len(pending_requests),
+            max_workers,
+            cached_exact,
+            cached_fallback,
+        )
+        batched_results = llm.chat_completion_batch(
+            pending_requests,
+            max_workers=max_workers,
+            allow_errors=True,
+        )
 
-    results: List[ClassifiedPaper] = []
-    for paper, result in zip(paper_list, batched_results):
-        if result.error:
-            LOGGER.warning(
-                "Skipping paper %s due to LLM error: %s",
-                paper.id,
-                result.error,
-            )
-            continue
-        response = result.output
-        if response is None:
-            LOGGER.warning("LLM returned no content for paper %s; skipping.", paper.id)
-            continue
-        try:
-            parsed_content = prepare_llm_json_content(response.content, context="classification")
-            data = json.loads(parsed_content)
-        except (json.JSONDecodeError, ValueError) as exc:
-            LOGGER.warning(
-                "Skipping paper %s due to JSON parse error: %s. Raw response: %s",
-                paper.id,
-                exc,
-                response.content,
-            )
-            continue
-        is_relevant = bool(data.get("is_relevant"))
-        try:
-            relevance_score = float(data.get("relevance_score", 0.0))
-        except (TypeError, ValueError):
-            relevance_score = 0.0
-        relevance_score = max(0.0, min(1.0, relevance_score))
-        reasoning = data.get("reasoning")
-        main_topic = data.get("main_topic")
-        results.append(
-            ClassifiedPaper(
+        for paper, result in zip(pending_papers, batched_results):
+            if result.error:
+                LOGGER.warning(
+                    "Skipping paper %s due to LLM error: %s",
+                    paper.id,
+                    result.error,
+                )
+                continue
+            response = result.output
+            if response is None:
+                LOGGER.warning("LLM returned no content for paper %s; skipping.", paper.id)
+                continue
+            try:
+                parsed_content = prepare_llm_json_content(response.content, context="classification")
+                data = json.loads(parsed_content)
+            except (json.JSONDecodeError, ValueError) as exc:
+                LOGGER.warning(
+                    "Skipping paper %s due to JSON parse error: %s. Raw response: %s",
+                    paper.id,
+                    exc,
+                    response.content,
+                )
+                continue
+            is_relevant = bool(data.get("is_relevant"))
+            try:
+                relevance_score = float(data.get("relevance_score", 0.0))
+            except (TypeError, ValueError):
+                relevance_score = 0.0
+            relevance_score = max(0.0, min(1.0, relevance_score))
+            reasoning = data.get("reasoning")
+            main_topic = data.get("main_topic")
+            classified = ClassifiedPaper(
                 paper=paper,
                 is_relevant=is_relevant,
                 relevance_score=relevance_score,
                 main_topic=main_topic,
                 reasoning=reasoning,
             )
+            result_map[paper.id] = classified
+            fresh_success += 1
+            LOGGER.debug(
+                "Layer 2 result: %s relevance=%.2f main_topic=%s",
+                paper.id,
+                relevance_score,
+                main_topic,
+            )
+            if cache:
+                cache.store_classification(
+                    classified,
+                    focus=focus,
+                    keywords=keywords,
+                    required_keywords=required_keywords,
+                    system_prompt=system_prompt,
+                )
+    else:
+        LOGGER.info(
+            "Skipped LLM classification call; all %d papers served from cache (exact=%d, cross_topic=%d).",
+            len(paper_list),
+            cached_exact,
+            cached_fallback,
         )
-        LOGGER.debug(
-            "Layer 2 result: %s relevance=%.2f main_topic=%s",
-            paper.id,
-            relevance_score,
-            main_topic,
+
+    results: List[ClassifiedPaper] = []
+    for paper in paper_list:
+        classified = result_map.get(paper.id)
+        if classified:
+            results.append(classified)
+        else:
+            LOGGER.warning("No classification result retained for paper %s; it will be skipped.", paper.id)
+
+    LOGGER.info(
+        "LLM classification produced %d scored papers (cache_exact=%d, cache_cross_topic=%d, fresh=%d).",
+        len(results),
+        cached_exact,
+        cached_fallback,
+        fresh_success,
+    )
+    if cached_fallback > 0:
+        LOGGER.info(
+            "Reused %d cached classifications computed under different topic contexts to save LLM calls.",
+            cached_fallback,
         )
-    LOGGER.info("LLM classification produced %d scored papers.", len(results))
     return results
 
 
@@ -463,9 +752,10 @@ def build_daily_report(
             if len(reasoning) > 0:
                 reasoning = reasoning.replace("\n", " ").strip()
             categories = ", ".join(paper.paper.categories) if paper.paper.categories else "未提供"
+            title_line = f"{paper.rank}. {paper.paper.title} (分数: {paper.relevance_score:.2f})"
             lines.extend(
                 [
-                    f"### {paper.rank}. {paper.paper.title} (分数: {paper.relevance_score:.2f})",
+                    f"**{title_line}**",
                     f"- **主题:** {paper.main_topic or 'Other'}",
                     f"- **LLM 评估:** {reasoning or '暂无说明'}",
                     f"- **摘要:** {summary or '暂无摘要'}",
@@ -566,6 +856,32 @@ def summarize_ranked_papers(
             )
     LOGGER.info("Generated %d abstractive summaries for ranked papers.", len(updated))
     return updated
+
+
+def _apply_cached_summaries(
+    cache: CacheManager | None,
+    ranked: Sequence[RankedPaper],
+) -> Tuple[List[RankedPaper], int]:
+    ranked_list = list(ranked)
+    if not ranked_list:
+        return [], 0
+    if cache is None:
+        missing = sum(1 for paper in ranked_list if not (paper.summary or "").strip())
+        return ranked_list, missing
+    updated: List[RankedPaper] = []
+    missing = 0
+    for paper in ranked_list:
+        summary = (paper.summary or "").strip()
+        if summary:
+            updated.append(paper.model_copy(update={"summary": summary}))
+            continue
+        cached = cache.load_summary(paper.paper)
+        if cached:
+            updated.append(paper.model_copy(update={"summary": cached}))
+        else:
+            updated.append(paper)
+            missing += 1
+    return updated, missing
 
 
 def _format_ranked_papers_for_summary(papers: Sequence[RankedPaper]) -> str:
