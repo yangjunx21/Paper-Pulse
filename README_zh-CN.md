@@ -8,7 +8,7 @@
 
 ## ✨ 核心功能
 
-- **多源获取**：聚合来自 ArXiv、Hugging Face Daily Papers、NeurIPS 等的论文。
+- **多源获取**：目前支持 **ArXiv**、**Hugging Face Daily Papers** 和 **NeurIPS 2025**。我们正在持续完善对所有主流 ML 会议和其他信息源的支持。
 - **意图解析代理**：将自然语言描述（例如 *“我对 LLM 的越狱攻击感兴趣”*）转换为具有优化关键词的结构化搜索配置文件。
 - **智能过滤**：
   - **第 1 层（关键词）**：使用 Trie/Set 匹配进行快速预过滤。
@@ -76,7 +76,7 @@
 使用您刚刚创建的配置文件执行主程序。
 ```bash
 # 将您的配置文件名称设置为环境变量
-export PROFILE_NAME="my_research_focus"
+export PROFILE_NAME="default"
 ./scripts/run_with_intent.sh
 ```
 *您可以在 `scripts/run_with_intent.sh` 中或通过环境变量（例如 `DATE_RANGE_START`）自定义参数。*
@@ -116,9 +116,15 @@ paper-pulse/
 
 您可以通过 CLI 参数或 `.env` 文件调整管道行为。关键环境变量：
 
-- `OPENAI_API_KEY`: 您的 LLM API 密钥。
-- `PAPER_PULSE_LANG`: 默认为 English。
-- `EMAIL_*`: 用于报告投递的 SMTP 设置。
+| 变量名 | 描述 | 默认值 |
+| :--- | :--- | :--- |
+| `OPENAI_API_KEY` | 您的 LLM API 密钥。 | 必填 |
+| `PAPER_PULSE_LANG` | 总结使用的语言 (例如 "Chinese", "English")。 | English |
+| `ENABLE_PDF_ANALYSIS` | 设置为 `true` 以启用 PDF 下载、全文提取和深度总结。 | `false` |
+| `RELEVANCE_THRESHOLD` | 纳入报告的最低 LLM 相关性评分 (0.0-1.0)。 | `0.8` |
+| `EMAIL_*` | 用于报告投递的 SMTP 设置。 | 可选 |
+
+> **💡 提示：** 启用 `ENABLE_PDF_ANALYSIS=true` 可以获得更丰富的见解（方法论、实验等），但这会消耗更多的 Token 和时间。
 
 ## 🖊️ 引用
 
@@ -129,7 +135,7 @@ paper-pulse/
   title  = {Paper Pulse: An LLM-Based Academic Paper Discovery and Analysis System},
   author = {Junxiao Yang},
   year   = {2025},
-  url    = {https://github.com/yourusername/paper-pulse}
+  url    = {https://github.com/yangjunx21/Paper-Pulse}
 }
 ```
 

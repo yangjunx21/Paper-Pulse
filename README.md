@@ -9,7 +9,7 @@
 
 ## ✨ Key Features
 
-- **Multi-Source Fetching**: Aggregates papers from ArXiv, Hugging Face Daily Papers, NeurIPS, and more.
+- **Multi-Source Fetching**: Currently supports **ArXiv**, **Hugging Face Daily Papers**, and **NeurIPS 2025**. Work is underway to support all major ML conferences and additional data sources.
 - **Intent Parsing Agent**: Converts natural language descriptions (e.g., *"I am interested in jailbreaking attacks on LLMs"*) into structured search profiles with optimized keywords.
 - **Intelligent Filtering**:
   - **Layer 1 (Keyword)**: Fast pre-filtering using Trie/Set matching.
@@ -77,7 +77,7 @@ Run the interactive builder to define your research interests.
 Execute the pipeline using the profile you just created.
 ```bash
 # Set your profile name as an environment variable
-export PROFILE_NAME="my_research_focus"
+export PROFILE_NAME="default"
 ./scripts/run_with_intent.sh
 ```
 *You can customize parameters in `scripts/run_with_intent.sh` or via environment variables (e.g., `DATE_RANGE_START`).*
@@ -117,9 +117,15 @@ paper-pulse/
 
 You can tweak the pipeline behavior via CLI arguments or the `.env` file. Key environment variables:
 
-- `OPENAI_API_KEY`: Your LLM API key.
-- `PAPER_PULSE_LANG`: Defaults to English.
-- `EMAIL_*`: SMTP settings for report delivery.
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `OPENAI_API_KEY` | Your LLM API key. | Required |
+| `PAPER_PULSE_LANG` | Language for summaries (e.g., "Chinese", "English"). | English |
+| `ENABLE_PDF_ANALYSIS` | **Crucial!** Set to `true` to download PDFs, extract full text, and generate deep summaries. | `false` |
+| `RELEVANCE_THRESHOLD` | Minimum LLM score (0.0-1.0) to include a paper in the report. | `0.6` |
+| `EMAIL_*` | SMTP settings for report delivery. | Optional |
+
+> **💡 Tip:** Enable `ENABLE_PDF_ANALYSIS=true` for much richer insights (Methodology, Experiments, etc.), but it will consume more tokens and time.
 
 ## 🖊️ Citation
 
@@ -130,7 +136,7 @@ If you find this project useful, please cite:
   title  = {Paper Pulse: An LLM-Based Academic Paper Discovery and Analysis System},
   author = {Junxiao Yang},
   year   = {2025},
-  url    = {https://github.com/yourusername/paper-pulse}
+  url    = {https://github.com/yangjunx21/Paper-Pulse}
 }
 ```
 
