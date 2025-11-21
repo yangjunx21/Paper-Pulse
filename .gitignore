@@ -1,44 +1,32 @@
-# Python bytecode and caches
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Packaging artifacts
-build/
-dist/
-pip-wheel-metadata/
-*.egg-info/
-*.egg
-
-# Virtual environments
-.env
-.venv
+*.pyc
+*.pyo
+*.pyd
+.Python
 env/
 venv/
-ENV/
-
-# Test and coverage outputs
-.pytest_cache/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
 .coverage
+.coverage.*
+.cache
+nosetests.xml
 coverage.xml
-htmlcov/
-
-# Type checker caches
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Logs and local databases
+*.cover
 *.log
-*.sqlite3
+.pytest_cache/
 
-# Editor and OS cruft
+# IDEs
 .vscode/
 .idea/
 *.swp
-*~
 .DS_Store
 
-# Streamlit local config
-.streamlit/
-
+# Project specific
+reports/
+config/intent_profiles/*.json
+!config/intent_profiles/default.json
+.env

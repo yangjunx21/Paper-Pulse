@@ -13,6 +13,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from ..models import RawPaper
+from ..progress import iter_with_progress
 from .base import PaperFetcher
 
 LOGGER = logging.getLogger(__name__)
@@ -82,7 +83,13 @@ class ArxivFetcher(PaperFetcher):
             end_date.isoformat(),
         )
         papers: List[RawPaper] = []
-        for offset, current in enumerate(_daterange(start_date, end_date), start=1):
+        total_days = (end_date - start_date).days + 1
+        day_iterator = iter_with_progress(
+            _daterange(start_date, end_date),
+            description="Fetching arXiv range",
+            total=total_days,
+        )
+        for offset, current in enumerate(day_iterator, start=1):
             LOGGER.debug("Fetching arXiv papers chunk %d for %s", offset, current.isoformat())
             chunk = self.fetch_by_date(current, None)
             papers.extend(chunk)
@@ -136,7 +143,11 @@ class ArxivFetcher(PaperFetcher):
             if not entries:
                 LOGGER.debug("No arXiv entries returned for query '%s' (start=%d).", search_query, start_index)
                 break
-            for entry in entries:
+            for entry in iter_with_progress(
+                entries,
+                description="Parsing arXiv batch",
+                total=len(entries),
+            ):
                 try:
                     parsed = self._parse_entry(entry)
                 except Exception as exc:  # pylint: disable=broad-except
@@ -161,6 +172,22 @@ class ArxivFetcher(PaperFetcher):
     @staticmethod
     def _parse_entry(entry: feedparser.FeedParserDict) -> RawPaper:
         authors = [author.name for author in entry.get("authors", [])]
+        affiliations = []
+        for author in entry.get("authors", []):
+            affiliation = None
+            if isinstance(author, dict):
+                affiliation = author.get("affiliation") or author.get("arxiv_affiliation")
+            else:
+                affiliation = getattr(author, "affiliation", None) or getattr(author, "arxiv_affiliation", None)
+            if affiliation:
+                text = str(affiliation).strip()
+                if text and text not in affiliations:
+                    affiliations.append(text)
+        entry_affiliation = entry.get("arxiv_affiliation")
+        if entry_affiliation:
+            text = str(entry_affiliation).strip()
+            if text and text not in affiliations:
+                affiliations.append(text)
         categories = []
         for tag in entry.get("tags", []):
             term = getattr(tag, "term", None)
@@ -169,15 +196,18 @@ class ArxivFetcher(PaperFetcher):
             if term:
                 categories.append(str(term))
         published = ArxivFetcher._parse_datetime(entry.get("published", entry.get("updated")))
+        pdf_url = ArxivFetcher._extract_pdf_url(entry)
         return RawPaper(
             id=entry["id"],
             title=entry["title"],
             summary=entry.get("summary", ""),
             authors=authors,
             link=entry["link"],
+            pdf_url=pdf_url,
             published=published,
             source=ArxivFetcher.source_name,
             categories=categories,
+            affiliations=affiliations,
         )
 
     @staticmethod
@@ -257,6 +287,31 @@ class ArxivFetcher(PaperFetcher):
         if len(clauses) == 1:
             return clauses[0]
         return " OR ".join(clauses)
+
+    @staticmethod
+    def _extract_pdf_url(entry: feedparser.FeedParserDict) -> Optional[str]:
+        links = entry.get("links", []) or []
+        for link_info in links:
+            href = getattr(link_info, "href", None)
+            link_type = getattr(link_info, "type", None)
+            title = getattr(link_info, "title", None)
+            if isinstance(link_info, dict):
+                href = href or link_info.get("href")
+                link_type = link_type or link_info.get("type")
+                title = title or link_info.get("title")
+            if not href:
+                continue
+            if isinstance(link_type, str) and "pdf" in link_type.lower():
+                return href
+            if isinstance(title, str) and "pdf" in title.lower():
+                return href
+        fallback = entry.get("link") or entry.get("id")
+        if isinstance(fallback, str) and "/abs/" in fallback:
+            pdf_url = fallback.replace("/abs/", "/pdf/")
+            if not pdf_url.endswith(".pdf"):
+                pdf_url = f"{pdf_url}.pdf"
+            return pdf_url
+        return None
 
 
 def _daterange(start: date, end: date):

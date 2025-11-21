@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
@@ -25,9 +25,12 @@ class RawPaper(BaseModel):
     summary: str
     authors: List[str]
     link: HttpUrl
+    pdf_url: Optional[HttpUrl] = None
+    full_text: Optional[str] = None
     published: datetime
     source: str
     categories: List[str] = Field(default_factory=list)
+    affiliations: List[str] = Field(default_factory=list)
 
 
 class ClassifiedPaper(BaseModel):
@@ -65,6 +68,8 @@ class PipelineSettings(BaseModel):
     relevance_threshold: float = 0.8
     fallback_report_limit: int = 10
     llm_max_workers: int = 4
+    summary_language: str = "English"
+    enable_pdf_analysis: bool = False
 
     @model_validator(mode="after")
     def _validate_dates(self) -> "PipelineSettings":
@@ -119,6 +124,9 @@ class PipelineSettings(BaseModel):
             file_path = str(self.keywords_file).strip()
             self.keywords_file = file_path or None
 
+        summary_language = str(self.summary_language or "").strip()
+        self.summary_language = summary_language or "English"
+
         normalized_sources: List[str] = []
         seen = set()
         for source in self.sources or []:
@@ -144,4 +152,5 @@ class PipelineResult(BaseModel):
     papers: List[RankedPaper]
     email_subject: str
     email_body: str
+    external_outputs: Dict[str, Any] = Field(default_factory=dict)
 

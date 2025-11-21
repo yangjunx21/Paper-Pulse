@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from pydantic import ValidationError
 
 from .models import ClassifiedPaper, PipelineSettings, RawPaper
+from .progress import iter_with_progress
 
 CACHE_VERSION = 1
 DEFAULT_CACHE_DIR = Path(os.getenv("PAPER_AGENT_CACHE_DIR", Path.home() / ".cache" / "paper_agent"))
@@ -167,7 +168,11 @@ class CacheManager:
             return None
         papers_data = data.get("papers", [])
         papers: List[RawPaper] = []
-        for item in papers_data:
+        for item in iter_with_progress(
+            papers_data,
+            description="Loading cached raw papers",
+            total=len(papers_data),
+        ):
             try:
                 paper = RawPaper.model_validate(item)
             except ValidationError:
@@ -241,7 +246,11 @@ class CacheManager:
             return None
         retained_ids = data.get("retained_ids", [])
         candidates: List[RawPaper] = []
-        for paper_id in retained_ids:
+        for paper_id in iter_with_progress(
+            retained_ids,
+            description="Reloading Layer 1 candidates",
+            total=len(retained_ids),
+        ):
             paper = raw_map.get(paper_id)
             if paper is None:
                 return None
@@ -348,7 +357,11 @@ class CacheManager:
     ) -> List[RawPaper]:
         records = self.load_filter_records(start_date=start_date, end_date=end_date)
         aggregated: Dict[str, RawPaper] = {}
-        for record in records:
+        for record in iter_with_progress(
+            records,
+            description="Scanning cached keyword filters",
+            total=len(records),
+        ):
             if not record.removed_by_keywords:
                 continue
             raw_papers = self.load_raw_papers_by_key(record.raw_key) or []

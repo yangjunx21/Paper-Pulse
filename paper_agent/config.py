@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-
 from dotenv import load_dotenv
 
 _ENV_FILE = os.getenv("PAPER_AGENT_ENV_FILE")
@@ -40,4 +39,5 @@ def get_optional_email_config() -> EmailConfig | None:
         return EmailConfig()
     except KeyError:
         return None
+
 

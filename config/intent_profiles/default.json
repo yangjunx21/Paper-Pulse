@@ -1,0 +1,36 @@
+{
+  "name": "default",
+  "description": "Research on LLM safety, focusing on jailbreaking attacks, hallucinations, and knowledge boundaries.",
+  "topics": [
+    "LLM safety",
+    "Trustworthy AI",
+    "Jailbreaking mechanisms"
+  ],
+  "keywords": [
+    "hallucination",
+    "knowledge boundary",
+    "attack",
+    "defense",
+    "trustworthy",
+    "safety",
+    "mechanism",
+    "boundary",
+    "jailbreaking",
+    "robustness",
+    "security",
+    "vulnerability",
+    "adversarial",
+    "mitigation",
+    "validation",
+    "verification",
+    "integrity",
+    "reliability"
+  ],
+  "required_keywords": [
+    "LLM",
+    "Generative AI"
+  ],
+  "notes": "Focus on mechanisms of jailbreaking attacks, hallucinations, and knowledge boundaries in LLMs.",
+  "created_at": "2025-11-21T09:10:30.096187+00:00",
+  "updated_at": "2025-11-21T09:10:30.096187+00:00"
+}

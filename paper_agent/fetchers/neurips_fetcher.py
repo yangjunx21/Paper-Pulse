@@ -128,11 +128,19 @@ class NeuripsFetcher(PaperFetcher):
         paper_id = f"{self.source_name}-{identifier}"
         title = str(item.get("name") or "").strip() or f"NeurIPS 2025 Paper {identifier}"
         summary = str(item.get("abstract") or "").strip()
-        authors = [
-            str(author.get("fullname")).strip()
-            for author in item.get("authors", [])
-            if isinstance(author, dict) and author.get("fullname")
-        ]
+        authors: List[str] = []
+        affiliations: List[str] = []
+        for author in item.get("authors", []):
+            if not isinstance(author, dict):
+                continue
+            name = str(author.get("fullname") or "").strip()
+            if name:
+                authors.append(name)
+            affiliation = str(
+                author.get("institution") or author.get("affiliation") or ""
+            ).strip()
+            if affiliation and affiliation not in affiliations:
+                affiliations.append(affiliation)
         link = _extract_link(item)
         published_str = item.get("starttime") or item.get("endtime")
         published = self._parse_datetime(published_str)
@@ -149,6 +157,7 @@ class NeuripsFetcher(PaperFetcher):
             published=published,
             source=self.source_name,
             categories=categories,
+            affiliations=affiliations,
         )
 
     @staticmethod

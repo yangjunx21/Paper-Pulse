@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
-from datetime import date
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .cache import CacheManager
 from .config import get_optional_email_config
@@ -16,12 +18,21 @@ from .llm.prompts import (
     CLASSIFICATION_USER_PROMPT_TEMPLATE,
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_USER_PROMPT_TEMPLATE,
+    AFFILIATION_SYSTEM_PROMPT,
+    AFFILIATION_USER_PROMPT_TEMPLATE,
 )
 from .llm.utils import prepare_llm_json_content
 from .mailer import EmailClient
 from .models import ClassifiedPaper, PipelineResult, PipelineSettings, RankedPaper, RawPaper
+from .parsers.pdf_utils import (
+    download_pdf,
+    extract_affiliation_snippet_from_pdf_bytes,
+    extract_text_from_pdf_bytes,
+    infer_affiliations_from_text,
+)
 from .rankers import HybridRanker
 from .keywords import resolve_keywords
+from .progress import iter_with_progress
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +55,11 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         date_descriptor = settings.target_date.isoformat()
     source_descriptor = ", ".join(settings.sources)
     focus = "; ".join(settings.topics) if settings.topics else "LLM Safety"
-    total_steps = 7 + (1 if should_send_email else 0)
+    total_steps = 7
+    if settings.enable_pdf_analysis:
+        total_steps += 1
+    if should_send_email:
+        total_steps += 1
     current_step = 0
 
     def log_step(description: str) -> int:
@@ -53,6 +68,7 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         LOGGER.info("[Step %d/%d] %s", current_step, total_steps, description)
         return current_step
 
+    report_date = settings.target_date or settings.end_date or settings.start_date or datetime.now(timezone.utc).date()
     LOGGER.info(
         "Starting paper recommendation pipeline for %s (sources: %s, focus: %s, email=%s).",
         date_descriptor,
@@ -97,7 +113,14 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         }
         aggregated: Dict[str, RawPaper] = {}
         total_collected = 0
-        for idx, fetcher in enumerate(fetchers, start=1):
+        for idx, fetcher in enumerate(
+            iter_with_progress(
+                fetchers,
+                description="Fetching from sources",
+                total=len(fetchers),
+            ),
+            start=1,
+        ):
             LOGGER.info(
                 "[Step %d/%d] Fetching progress %d/%d -> source %s",
                 fetch_step_index,
@@ -112,7 +135,11 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
                 LOGGER.error("Failed to fetch papers from source '%s': %s", fetcher.source_name, exc, exc_info=exc)
                 continue
             LOGGER.info("Source %s returned %d papers.", fetcher.source_name, len(fetched))
-            for paper in fetched:
+            for paper in iter_with_progress(
+                fetched,
+                description=f"Processing {fetcher.source_name}",
+                total=len(fetched),
+            ):
                 total_collected += 1
                 existing = aggregated.get(paper.id)
                 if existing:
@@ -248,16 +275,59 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         paper.model_copy(update={"rank": idx})
         for idx, paper in enumerate(relevant_ranked, start=1)
     ]
+    if settings.enable_pdf_analysis:
+        pdf_step_index = log_step("Enriching ranked papers with PDF full text")
+        arxiv_candidates = [paper.paper for paper in relevant_ranked if paper.paper.source.lower() == "arxiv"]
+        if arxiv_candidates:
+            enriched_count, affiliation_updates = _enrich_papers_with_pdf_content(arxiv_candidates)
+            if enriched_count or affiliation_updates:
+                raw_key = cache.store_raw_papers(settings, raw_papers)
+                LOGGER.info(
+                    "[Step %d/%d] PDF enrichment complete: %d texts updated, %d affiliation lists enhanced (cache=%s).",
+                    pdf_step_index,
+                    total_steps,
+                    enriched_count,
+                    affiliation_updates,
+                    raw_key[:8],
+                )
+            else:
+                LOGGER.info(
+                    "[Step %d/%d] Ranked papers already had PDF content; no updates applied.",
+                    pdf_step_index,
+                    total_steps,
+                )
+        else:
+            LOGGER.info(
+                "[Step %d/%d] No ranked arXiv papers required PDF enrichment.",
+                pdf_step_index,
+                total_steps,
+            )
     relevant_ranked, missing_summaries = _apply_cached_summaries(cache, relevant_ranked)
     summary_step_index = log_step("Generating LLM summaries")
-    if missing_summaries > 0:
+    if not settings.enable_pdf_analysis:
+        message = (
+            "Skipping LLM summaries because PDF reading is disabled (missing summaries remain)."
+            if missing_summaries > 0
+            else "All summaries sourced from cache; PDF reading is disabled so no new LLM calls."
+        )
+        LOGGER.info(
+            "[Step %d/%d] %s",
+            summary_step_index,
+            total_steps,
+            message,
+        )
+    elif missing_summaries > 0:
         LOGGER.info(
             "[Step %d/%d] Will generate or update summaries for %d papers, remaining summaries from cache.",
             summary_step_index,
             total_steps,
             missing_summaries,
         )
-        relevant_ranked = summarize_ranked_papers(llm, relevant_ranked)
+        relevant_ranked = summarize_ranked_papers(
+            llm,
+            relevant_ranked,
+            tldr_language=settings.summary_language,
+        )
         for ranked_paper in relevant_ranked:
             if cache and ranked_paper.summary:
                 cache.store_summary(ranked_paper.paper, ranked_paper.summary)
@@ -273,16 +343,18 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         focus,
         date_descriptor,
         source_descriptor,
+        include_llm_analysis=settings.enable_pdf_analysis,
     )
+    _persist_local_digest(email_subject, email_body)
 
-    if should_send_email:
+    external_outputs: Dict[str, Any] = {}
+    if should_send_email and email_config:
         log_step("Sending email notification")
         EmailClient(email_config).send_markdown_email(
             subject=email_subject,
             body_markdown=email_body,
             receiver=settings.receiver_email,
         )
-
     LOGGER.info(
         "Pipeline completed for %s. Final report contains %d papers.",
         date_descriptor,
@@ -294,6 +366,7 @@ def generate_recommendations(settings: PipelineSettings) -> PipelineResult:
         papers=relevant_ranked,
         email_subject=email_subject,
         email_body=email_body,
+        external_outputs=external_outputs,
     )
 
 
@@ -307,6 +380,8 @@ def generate_gap_fill_digest(
     if week_start > week_end:
         raise ValueError("week_start must be on or before week_end.")
     email_config = get_optional_email_config()
+    if settings.send_email and not email_config:
+        raise ValueError("Send email requested but email config environment variables are missing.")
     should_send_email = bool(settings.send_email and email_config)
     cache = CacheManager()
     llm = LLMClient()
@@ -324,7 +399,11 @@ def generate_gap_fill_digest(
     if max_candidates:
         candidates = candidates[:max_candidates]
     unique_candidates: Dict[str, RawPaper] = {}
-    for paper in candidates:
+    for paper in iter_with_progress(
+        candidates,
+        description="Preparing weekly candidates",
+        total=len(candidates),
+    ):
         unique_candidates.setdefault(paper.id, paper)
     candidate_list = list(unique_candidates.values())
     LOGGER.info(
@@ -370,23 +449,34 @@ def generate_gap_fill_digest(
         for idx, paper in enumerate(relevant_ranked, start=1)
     ]
     relevant_ranked, missing_summaries = _apply_cached_summaries(cache, relevant_ranked)
-    if missing_summaries > 0:
+    if settings.enable_pdf_analysis and missing_summaries > 0:
         LOGGER.info(
             "Generating new summaries for %d gap-fill papers.",
             missing_summaries,
         )
-        relevant_ranked = summarize_ranked_papers(llm, relevant_ranked)
+        relevant_ranked = summarize_ranked_papers(
+            llm,
+            relevant_ranked,
+            tldr_language=settings.summary_language,
+        )
         for ranked_paper in relevant_ranked:
             if ranked_paper.summary:
                 cache.store_summary(ranked_paper.paper, ranked_paper.summary)
+    elif missing_summaries > 0 and not settings.enable_pdf_analysis:
+        LOGGER.info(
+            "Skipping LLM summaries for %d gap-fill papers because PDF reading is disabled.",
+            missing_summaries,
+        )
     date_descriptor = f"{week_start.isoformat()} to {week_end.isoformat()} (keyword gap-fill)"
-    _, email_body = build_daily_report(
+    email_subject, email_body = build_daily_report(
         relevant_ranked,
         focus,
         date_descriptor,
         source_descriptor,
+        include_llm_analysis=settings.enable_pdf_analysis,
     )
-    email_subject = f"Weekly LLM Safety Gap-Fill ({week_start.isoformat()} to {week_end.isoformat()})"
+    _persist_local_digest(email_subject, email_body)
+    external_outputs: Dict[str, Any] = {}
     if should_send_email and email_config:
         EmailClient(email_config).send_markdown_email(
             subject=email_subject,
@@ -402,7 +492,28 @@ def generate_gap_fill_digest(
         papers=relevant_ranked,
         email_subject=email_subject,
         email_body=email_body,
+        external_outputs=external_outputs,
     )
+
+
+def _persist_local_digest(
+    subject: str,
+    body_markdown: str,
+    *,
+    directory: Optional[Path] = None,
+) -> Path:
+    target_dir = directory or (Path.cwd() / "reports")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_subject = re.sub(r"[^A-Za-z0-9_-]+", "-", subject).strip("-")
+    if not safe_subject:
+        safe_subject = "digest"
+    filename = f"{timestamp}_{safe_subject}.md"
+    filepath = target_dir / filename
+    content = f"# {subject}\n\n{body_markdown.strip()}\n"
+    filepath.write_text(content, encoding="utf-8")
+    LOGGER.info("Saved local digest copy to %s", filepath)
+    return filepath
 
 
 def _instantiate_fetchers(source_names: Sequence[str]) -> List[PaperFetcher]:
@@ -413,6 +524,123 @@ def _instantiate_fetchers(source_names: Sequence[str]) -> List[PaperFetcher]:
         except ValueError as exc:
             LOGGER.error("Unable to initialize fetcher for source '%s': %s", source, exc)
     return fetchers
+
+
+AFFILIATION_MIN_COUNT = 1
+
+
+def _enrich_papers_with_pdf_content(papers: Sequence[RawPaper]) -> Tuple[int, int]:
+    enriched = 0
+    affiliation_updates = 0
+    llm = LLMClient()  # Instantiate LLM for affiliation extraction
+
+    for paper in iter_with_progress(
+        papers,
+        description="PDF enrichment",
+        total=len(papers),
+    ):
+        if paper.source.lower() != "arxiv":
+            continue
+        has_full_text = _has_meaningful_full_text(paper)
+        needs_full_text = not has_full_text
+        
+        # Check if affiliations are truly present (ignoring "Unknown", "None", etc.)
+        current_affiliations = paper.affiliations or []
+        valid_affiliations = [
+            aff for aff in current_affiliations 
+            if aff and aff.lower() not in {"unknown", "none", "not provided", "null"}
+        ]
+        needs_affiliations = len(valid_affiliations) < AFFILIATION_MIN_COUNT
+        
+        # Case 1: We already have full text but need affiliations
+        if has_full_text and needs_affiliations:
+            full_text_content = getattr(paper, "full_text", "") or ""
+            inferred_from_existing = _extract_affiliations_with_llm(llm, full_text_content)
+            if inferred_from_existing and inferred_from_existing != paper.affiliations:
+                paper.affiliations = inferred_from_existing
+                affiliation_updates += 1
+            continue
+            
+        # Case 2: We need to fetch PDF
+        if not needs_full_text and not needs_affiliations:
+            continue
+        pdf_url = _resolve_pdf_url(paper)
+        if not pdf_url:
+            continue
+        pdf_payload = download_pdf(pdf_url)
+        if not pdf_payload:
+            continue
+            
+        # Try to get full text if needed
+        full_text = ""
+        if needs_full_text:
+            full_text = extract_text_from_pdf_bytes(pdf_payload)
+            if full_text:
+                paper.full_text = full_text
+                enriched += 1
+        
+        # If we just fetched full text (or have it), and need affiliations, use LLM
+        affiliation_source = full_text
+        if not affiliation_source and needs_affiliations:
+            # If full extraction failed or wasn't requested, try snippet extraction
+            snippet_text = extract_affiliation_snippet_from_pdf_bytes(pdf_payload)
+            affiliation_source = snippet_text
+
+        if needs_affiliations and affiliation_source:
+            inferred_affiliations = _extract_affiliations_with_llm(llm, affiliation_source)
+            if inferred_affiliations and inferred_affiliations != paper.affiliations:
+                paper.affiliations = inferred_affiliations
+                affiliation_updates += 1
+    return enriched, affiliation_updates
+
+
+def _extract_affiliations_with_llm(llm: LLMClient, text: str) -> List[str]:
+    """Extracts affiliations using LLM from the provided text."""
+    if not text:
+        return []
+    
+    # Take first ~500 words or ~3000 chars to stay within reasonable context
+    # Usually affiliations are at the start.
+    truncated_text = text[:3500] 
+    
+    payload = AFFILIATION_USER_PROMPT_TEMPLATE.format(text=truncated_text)
+    messages = [
+        LLMMessage(role="system", content=AFFILIATION_SYSTEM_PROMPT),
+        LLMMessage(role="user", content=payload),
+    ]
+    
+    try:
+        response = llm.chat_completion(messages)
+        content = (response.content or "").strip()
+        if not content or content.lower() == "unknown":
+            return []
+        
+        # Split by comma and clean up
+        affiliations = [aff.strip() for aff in content.split(",") if aff.strip()]
+        return affiliations
+    except Exception as e:
+        LOGGER.warning("Failed to extract affiliations with LLM: %s", e)
+        return []
+
+
+def _has_meaningful_full_text(paper: RawPaper, *, min_chars: int = 600) -> bool:
+    content = getattr(paper, "full_text", None)
+    if not isinstance(content, str):
+        return False
+    return len(content.strip()) >= min_chars
+
+
+def _resolve_pdf_url(paper: RawPaper) -> Optional[str]:
+    pdf_url = getattr(paper, "pdf_url", None)
+    if isinstance(pdf_url, str) and pdf_url.strip():
+        return pdf_url
+    link = str(paper.link or "")
+    if "arxiv.org" in link and "/abs/" in link:
+        pdf_url = link.replace("/abs/", "/pdf/")
+        if not pdf_url.endswith(".pdf"):
+            pdf_url = f"{pdf_url}.pdf"
+        return pdf_url
+    return None
 
 
 def _merge_raw_papers(primary: RawPaper, secondary: RawPaper) -> RawPaper:
@@ -500,7 +728,11 @@ def filter_papers_by_keywords(papers: Iterable[RawPaper], keywords: Iterable[str
         LOGGER.debug("No keywords provided; returning all %d papers.", len(paper_list))
         return paper_list
     filtered: List[RawPaper] = []
-    for paper in paper_list:
+    for paper in iter_with_progress(
+        paper_list,
+        description="Keyword filtering",
+        total=len(paper_list),
+    ):
         haystack = f"{paper.title} {paper.summary}".lower()
         if any(keyword in haystack for keyword in keyword_list):
             filtered.append(paper)
@@ -519,7 +751,11 @@ def filter_papers_by_required_keywords(
         return paper_list
     LOGGER.info("Applying mandatory keyword filter with %d required keywords.", len(required_list))
     filtered: List[RawPaper] = []
-    for paper in paper_list:
+    for paper in iter_with_progress(
+        paper_list,
+        description="Required keyword filtering",
+        total=len(paper_list),
+    ):
         haystack = f"{paper.title} {paper.summary}".lower()
         if any(required in haystack for required in required_list):
             filtered.append(paper)
@@ -555,7 +791,11 @@ def classify_with_llm(
     keywords_text = ", ".join(keywords) if keywords else "Not provided"
     required_keywords_text = ", ".join(required_keywords) if required_keywords else "None"
 
-    for paper in paper_list:
+    for paper in iter_with_progress(
+        paper_list,
+        description="Preparing LLM classification payloads",
+        total=len(paper_list),
+    ):
         cached_result: Optional[ClassifiedPaper] = None
         exact_match = False
         if cache:
@@ -616,7 +856,12 @@ def classify_with_llm(
             allow_errors=True,
         )
 
-        for paper, result in zip(pending_papers, batched_results):
+        progress_results = iter_with_progress(
+            batched_results,
+            description="Processing LLM classification responses",
+            total=len(batched_results),
+        )
+        for paper, result in zip(pending_papers, progress_results):
             if result.error:
                 LOGGER.warning(
                     "Skipping paper %s due to LLM error: %s",
@@ -679,7 +924,11 @@ def classify_with_llm(
         )
 
     results: List[ClassifiedPaper] = []
-    for paper in paper_list:
+    for paper in iter_with_progress(
+        paper_list,
+        description="Collecting classification results",
+        total=len(paper_list),
+    ):
         classified = result_map.get(paper.id)
         if classified:
             results.append(classified)
@@ -706,7 +955,55 @@ def build_daily_report(
     focus: str,
     date_descriptor: str,
     sources_descriptor: str,
+    *,
+    include_llm_analysis: bool,
 ) -> tuple[str, str]:
+    def _format_authors(authors: Sequence[str], max_display: int = 10, tail_keep: int = 3) -> str:
+        names = [str(author).strip() for author in authors if str(author).strip()]
+        if not names:
+            return "Unknown"
+        if len(names) <= max_display:
+            return ", ".join(names)
+        tail = min(tail_keep, max_display - 1)
+        head = max_display - tail - 1
+        if head <= 0:
+            head = max(1, max_display - tail)
+        head_section = names[:head]
+        tail_section = names[-tail:] if tail > 0 else []
+        return ", ".join([*head_section, "…", *tail_section])
+
+    def _resolve_institutions(summary_value: str, affiliations: Sequence[str]) -> str:
+        if summary_value and summary_value.strip() and summary_value.strip().lower() != "unknown":
+            return summary_value.strip()
+        unique: List[str] = []
+        for affiliation in affiliations:
+            text = str(affiliation).strip()
+            if text and text not in unique:
+                unique.append(text)
+            if len(unique) >= 10:
+                break
+        return ", ".join(unique) if unique else "Unknown"
+
+    def _extract_institutions_from_summary_text(
+        summary_text: str,
+        affiliations: Sequence[str],
+    ) -> str:
+        fallback = _resolve_institutions("", affiliations)
+        if not summary_text:
+            return fallback
+        # Support both old emoji style and new markdown bullet style
+        match = re.search(r"^(?:🏛️|- \*\*Affiliations\*\*[:：])\s*(.+)$", summary_text, flags=re.MULTILINE)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate and candidate.lower() not in {"not provided", "unknown"}:
+                return candidate
+        return fallback
+
+    def _single_line(value: str) -> str:
+        if not value:
+            return ""
+        return " ".join(value.split())
+
     ranked_list = list(ranked)
     subject = f"Daily LLM Safety Paper Digest ({date_descriptor})"
     lines: List[str] = [
@@ -719,12 +1016,14 @@ def build_daily_report(
     if not ranked_list:
         lines.append("No papers found matching the criteria today. Consider lowering the threshold or expanding the search range.")
     else:
-        for paper in ranked_list:
-            summary = (paper.summary or paper.paper.summary or "").strip()
-            if len(summary) > 0:
-                summary = summary.replace("\n", " ").strip()
+        for paper in iter_with_progress(
+            ranked_list,
+            description="Building report entries",
+            total=len(ranked_list),
+        ):
+            summary_raw = (paper.summary or paper.paper.summary or "").strip()
             reasoning = (paper.reasoning or "").strip()
-            if len(reasoning) > 0:
+            if reasoning:
                 reasoning = reasoning.replace("\n", " ").strip()
             categories = ", ".join(paper.paper.categories) if paper.paper.categories else "Not provided"
             title_text = " ".join(paper.paper.title.split())
@@ -734,13 +1033,39 @@ def build_daily_report(
                     f"**{title_line}**",
                     f"- **Topic:** {paper.main_topic or 'Other'}",
                     f"- **LLM Assessment:** {reasoning or 'No explanation'}",
-                    f"- **Summary:** {summary or 'No summary'}",
                     f"- **arXiv Categories:** {categories}",
+                    f"- **Authors:** {_format_authors(paper.paper.authors)}",
                     f"- **Source:** {paper.paper.source}",
                     f"- **Link:** {paper.paper.link}",
-                    "",
                 ]
             )
+            institutions = _extract_institutions_from_summary_text(summary_raw, paper.paper.affiliations)
+            lines.append(f"- **Institutions:** {institutions}")
+            summary_text = summary_raw.strip()
+            abstract_text = _single_line(paper.paper.summary or "")
+            if include_llm_analysis and summary_text:
+                lines.append("- **Summary (LLM Analysis):**")
+                summary_lines = []
+                for line in summary_text.splitlines():
+                    stripped = line.strip()
+                    # Skip empty lines and metadata lines we extract separately
+                    if not stripped:
+                        continue
+                    if stripped.startswith("🏛️"):
+                        continue
+                    # Skip the "Affiliations" line in the summary body if we've already extracted it
+                    if stripped.startswith("- **Affiliations**"):
+                        continue
+                    summary_lines.append(f"  {line}")
+                if summary_lines:
+                    lines.extend(summary_lines)
+                else:
+                    lines.extend([f"  {line}" for line in summary_text.splitlines() if line.strip()])
+                lines.append(f"- **Abstract:** {abstract_text or 'Not provided'}")
+            else:
+                fallback_summary = abstract_text or _single_line(summary_text)
+                lines.append(f"- **Summary:** {fallback_summary or 'No summary'}")
+            lines.append("")
     lines.append("---")
     body = "\n".join(lines).strip()
     LOGGER.info("Generated Markdown report with %d entries.", len(ranked_list))
@@ -751,21 +1076,21 @@ def summarize_ranked_papers(
     llm: LLMClient,
     ranked: Sequence[RankedPaper],
     *,
+    tldr_language: str = "English",
     max_attempts: int = 3,
 ) -> List[RankedPaper]:
     ranked_list = list(ranked)
     if not ranked_list:
         return []
     payload = SUMMARY_USER_PROMPT_TEMPLATE.format(
-        papers=_format_ranked_papers_for_summary(ranked_list)
+        language=tldr_language,
+        papers=_format_ranked_papers_for_summary(ranked_list),
     )
     messages = [
         LLMMessage(role="system", content=SUMMARY_SYSTEM_PROMPT),
         LLMMessage(role="user", content=payload),
     ]
-    last_error: Optional[Exception] = None
     last_response_content: Optional[str] = None
-    data: Optional[dict] = None
 
     def _with_fallback_summaries() -> List[RankedPaper]:
         LOGGER.warning(
@@ -778,49 +1103,58 @@ def summarize_ranked_papers(
             updated.append(paper.model_copy(update={"summary": fallback}))
         return updated
 
+    def _parse_sectioned_summaries(raw_content: str) -> dict[str, str]:
+        summary_map: dict[str, str] = {}
+        if not raw_content:
+            return summary_map
+        blocks = re.split(r"\n\s*-{3,}\s*\n", raw_content.strip())
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            lines = block.splitlines()
+            header = lines[0].strip()
+            # Robust extraction for "Paper ID: <id>" pattern
+            match = re.search(r"paper\s*id\s*[:：]\s*(.*)", header, re.IGNORECASE)
+            if not match:
+                LOGGER.debug("Skipping summary block without Paper ID header: %s", block)
+                continue
+            # Extract ID and clean up any remaining markdown chars (e.g. trailing **)
+            paper_id = match.group(1).strip().strip("*")
+            body = "\n".join(lines[1:]).strip()
+            if paper_id and body:
+                summary_map[paper_id] = body
+            else:
+                LOGGER.debug("Incomplete summary block for paper '%s': %s", paper_id, block)
+        return summary_map
+
+    summary_map: dict[str, str] = {}
     for attempt in range(1, max_attempts + 1):
         response = llm.chat_completion(messages)
-        last_response_content = response.content
-        try:
-            parsed_content = prepare_llm_json_content(response.content, context="summaries")
-            data = json.loads(parsed_content)
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-            LOGGER.warning(
-                "Attempt %s/%s to generate summaries failed: %s",
-                attempt,
-                max_attempts,
-                exc,
-                exc_info=True,
-            )
-            if attempt == max_attempts:
-                LOGGER.error(
-                    "Failed to obtain valid LLM summaries after %s attempts. Last response: %s",
-                    max_attempts,
-                    last_response_content,
-                )
-                return _with_fallback_summaries()
-            continue
-        else:
+        last_response_content = (response.content or "").strip()
+        summary_map = _parse_sectioned_summaries(last_response_content)
+        if summary_map:
             break
-
-    if data is None:
-        LOGGER.error(
-            "LLM summarization did not return data despite %s attempts. Last error: %s",
+        LOGGER.warning(
+            "Attempt %s/%s to generate summaries returned no valid entries. Raw response: %s",
+            attempt,
             max_attempts,
-            last_error,
+            last_response_content,
         )
-        return _with_fallback_summaries()
-    summary_map: dict[str, str] = {}
-    for item in data.get("papers", []):
-        if not isinstance(item, dict):
-            continue
-        paper_id = str(item.get("paper_id") or "").strip()
-        summary = str(item.get("summary") or "").strip()
-        if paper_id and summary:
-            summary_map[paper_id] = summary
+        if attempt == max_attempts:
+            LOGGER.error(
+                "Failed to obtain narrative summaries after %s attempts. Last response: %s",
+                max_attempts,
+                last_response_content,
+            )
+            return _with_fallback_summaries()
+
     updated: List[RankedPaper] = []
-    for paper in ranked_list:
+    for paper in iter_with_progress(
+        ranked_list,
+        description="Attaching narrative summaries",
+        total=len(ranked_list),
+    ):
         replacement = summary_map.get(paper.paper.id)
         if replacement:
             updated.append(paper.model_copy(update={"summary": replacement}))
@@ -830,7 +1164,7 @@ def summarize_ranked_papers(
             LOGGER.warning(
                 "No LLM summary returned for paper %s; using existing summary.", paper.paper.id
             )
-    LOGGER.info("Generated %d abstractive summaries for ranked papers.", len(updated))
+    LOGGER.info("Generated %d narrative summaries for ranked papers.", len(updated))
     return updated
 
 
@@ -846,7 +1180,11 @@ def _apply_cached_summaries(
         return ranked_list, missing
     updated: List[RankedPaper] = []
     missing = 0
-    for paper in ranked_list:
+    for paper in iter_with_progress(
+        ranked_list,
+        description="Applying summaries",
+        total=len(ranked_list),
+    ):
         summary = (paper.summary or "").strip()
         if summary:
             updated.append(paper.model_copy(update={"summary": summary}))
@@ -862,20 +1200,29 @@ def _apply_cached_summaries(
 
 def _format_ranked_papers_for_summary(papers: Sequence[RankedPaper]) -> str:
     formatted: List[str] = []
-    for paper in papers:
+    for paper in iter_with_progress(
+        papers,
+        description="Formatting ranked papers",
+        total=len(papers),
+    ):
         authors = ", ".join(paper.paper.authors[:10])
+        affiliations = ", ".join(paper.paper.affiliations[:10]) or "Unknown"
         existing_summary = (paper.summary or "").strip()
         full_text = _extract_full_text(paper)
         lines = [
             f"- paper_id: {paper.paper.id}",
             f"  title: {paper.paper.title}",
             f"  authors: {authors}",
+            f"  affiliations: {affiliations}",
             f"  link: {paper.paper.link}",
         ]
         if existing_summary:
             lines.append(f"  prior_summary: {existing_summary}")
         if full_text:
-            lines.append(f"  full_text: {full_text}")
+            # Use a delimited block for full text to help LLM parse it
+            lines.append("  full_text: >>>")
+            lines.append(full_text)
+            lines.append("<<<")
         else:
             lines.append("  full_text: [No content available]")
         formatted.append("\n".join(lines))

@@ -8,6 +8,14 @@ from typing import Optional, Tuple
 
 from .models import AVAILABLE_SOURCES, PipelineSettings
 from .pipeline import generate_gap_fill_digest, generate_recommendations
+from .intent_profiles import (
+    IntentProfile,
+    IntentProfileNotFoundError,
+    IntentProfileStore,
+    apply_profile_defaults,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _valid_date(value: str) -> date:
@@ -82,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of parallel LLM requests (default: 4).",
     )
     parser.add_argument(
+        "--summary-language",
+        default="English",
+        help="Language to use for structured LLM summaries (default: English).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
@@ -98,6 +111,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keywords-file",
         help="Path to a YAML file that defines the keywords used for filtering and LLM prompts.",
+    )
+    parser.add_argument(
+        "--intent-profile",
+        help="Name of a stored intent profile to load (create via `python -m paper_agent.intent_cli`).",
+    )
+    parser.add_argument(
+        "--intent-config-dir",
+        help="Override the directory that stores intent profiles.",
+    )
+    parser.add_argument(
+        "--skip-intent-profile",
+        action="store_true",
+        help="Disable automatic loading of saved intent profiles.",
+    )
+    parser.add_argument(
+        "--enable-pdf-analysis",
+        action="store_true",
+        help="Download arXiv PDFs to enrich author affiliations and LLM full-text summaries.",
     )
     parser.add_argument(
         "--required-keywords",
@@ -140,9 +171,13 @@ def _build_settings_kwargs(
         settings_kwargs["keywords_file"] = args.keywords_file
     if args.required_keywords:
         settings_kwargs["required_keywords"] = args.required_keywords
+    settings_kwargs["enable_pdf_analysis"] = args.enable_pdf_analysis
+    settings_kwargs["summary_language"] = args.summary_language
     settings_kwargs["relevance_threshold"] = args.relevance_threshold
     settings_kwargs["fallback_report_limit"] = args.fallback_report_limit
     settings_kwargs["llm_max_workers"] = args.llm_workers
+
+    _maybe_apply_intent_profile(args, settings_kwargs)
 
     if date_range_override:
         start_date, end_date = date_range_override
@@ -156,6 +191,34 @@ def _build_settings_kwargs(
         elif args.date is not None:
             settings_kwargs["target_date"] = args.date
     return settings_kwargs
+
+
+def _maybe_apply_intent_profile(args: argparse.Namespace, settings_kwargs: dict) -> None:
+    profile = _load_intent_profile(args)
+    if not profile:
+        return
+    apply_profile_defaults(settings_kwargs, profile)
+    LOGGER.info(
+        "Loaded intent profile '%s' (topics=%d, keywords=%d, required=%d).",
+        profile.name,
+        len(profile.topics),
+        len(profile.keywords),
+        len(profile.required_keywords),
+    )
+
+
+def _load_intent_profile(args: argparse.Namespace) -> IntentProfile | None:
+    if getattr(args, "skip_intent_profile", False):
+        LOGGER.debug("Skipping intent profile loading because --skip-intent-profile is set.")
+        return None
+    profile_name = args.intent_profile
+    if not profile_name:
+        return None
+    store = IntentProfileStore(args.intent_config_dir)
+    try:
+        return store.load(profile_name)
+    except IntentProfileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _run_pipeline(
