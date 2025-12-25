@@ -31,7 +31,7 @@
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/paper-pulse.git
+   git clone https://github.com/yangjunx21/paper-pulse.git
    cd paper-pulse
    ```
 
